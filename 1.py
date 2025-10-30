@@ -1,426 +1,455 @@
-import logging
-import asyncio
-import json
 import os
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    filters,
+    CallbackQueryHandler,
     ContextTypes,
-    filters
 )
+from datetime import datetime
 
-# === Настройки ===
-BOT_TOKEN = "8244258907:AAGSOfk1CMoBku1ChaL-lTEjWdFG7ll_EYo"
-ADMIN_IDS = [6893832048]
-PUBLIC_MODE = True
-CONFIG_FILE = "user_configs.json"
-
-# === Конфигурация ===
-class UserConfig:
-    def __init__(self):
-        self.source_chat_id = None
-        self.backup_chat_id = None
-        self.is_active = False
-        self.forward_mode = "forward"
-        self.content_types = {
-            "text": True,
-            "photo": True,
-            "video": True,
-            "document": True,
-            "audio": True,
-            "voice": True,
-            "sticker": True,
-            "poll": True,
-            "location": True
-        }
-
-    def to_dict(self):
-        return {
-            "source_chat_id": self.source_chat_id,
-            "backup_chat_id": self.backup_chat_id,
-            "is_active": self.is_active,
-            "forward_mode": self.forward_mode,
-            "content_types": self.content_types
-        }
-
-    @classmethod
-    def from_dict(cls, data):
-        config = cls()
-        config.source_chat_id = data.get("source_chat_id")
-        config.backup_chat_id = data.get("backup_chat_id")
-        config.is_active = data.get("is_active", False)
-        config.forward_mode = data.get("forward_mode", "forward")
-        config.content_types = data.get("content_types", {
-            "text": True, "photo": True, "video": True, "document": True,
-            "audio": True, "voice": True, "sticker": True, "poll": True, "location": True
-        })
-        return config
-
-# Глобальная переменная для хранения конфигов
-user_configs = {}
-
-# === Функции для работы с файлом конфигурации ===
-def save_configs():
-    """Сохраняет все конфиги пользователей в файл"""
-    try:
-        config_data = {}
-        for user_id, config in user_configs.items():
-            config_data[str(user_id)] = config.to_dict()
-
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=2)
-        logging.info("Конфигурации сохранены")
-    except Exception as e:
-        logging.error(f"Ошибка сохранения конфигураций: {e}")
-
-def load_configs():
-    """Загружает конфиги пользователей из файла"""
-    global user_configs
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                config_data = json.load(f)
-
-            user_configs = {}
-            for user_id_str, config_dict in config_data.items():
-                user_id = int(user_id_str)
-                user_configs[user_id] = UserConfig.from_dict(config_dict)
-            logging.info("Конфигурации загружены")
-        else:
-            user_configs = {}
-            logging.info("Файл конфигураций не найден, создан новый")
-    except Exception as e:
-        logging.error(f"Ошибка загрузки конфигураций: {e}")
-        user_configs = {}
-
-# === Логирование ===
+# ---------- НАСТРОЙКИ ----------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-# === Проверки доступа ===
-def check_access(user_id: int) -> bool:
-    return PUBLIC_MODE or user_id in ADMIN_IDS
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+ALLOWED_EXTENSIONS = ['.py', '.txt', '.json', '.mcpack', '.mcaddon', '.png', '.jpg', '.jpeg']
+SUBSCRIPTION_PRICE = 299  # руб.
+ADMIN_IDS = [6893832048]   # замените на свой TG-ID
+FILES_PER_PAGE = 5
 
-async def is_admin(bot, user_id, chat_id) -> bool:
+# ---------- СОСТОЯНИЯ ----------
+WAITING_FOR_FILE, WAITING_FOR_NAME, WAITING_FOR_EXTENSION, WAITING_FOR_SEARCH = range(4)
+
+# ---------- ХРАНИЛИЩА ----------
+user_files = {}
+subscribed_users = set()
+file_search_cache = {}
+
+# ---------- УТИЛИТЫ ----------
+async def get_file_size(bot, file_id: str) -> int:
     try:
-        chat_member = await bot.get_chat_member(chat_id, user_id)
-        return chat_member.status in ["administrator", "creator"]
-    except Exception as e:
-        logging.error(f"Ошибка проверки прав: {e}")
-        return False
+        file = await bot.get_file(file_id)
+        return file.file_size or 0
+    except Exception:
+        return 0
 
-# === Клавиатуры ===
-def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    config = user_configs.get(user_id, UserConfig())
-    buttons = [
-        [
-            InlineKeyboardButton("📌 Установить основной канал", callback_data="set_source"),
-            InlineKeyboardButton("📌 Установить резервный канал", callback_data="set_backup")
-        ],
-        [
-            InlineKeyboardButton("🔧 Настройки контента", callback_data="content_settings"),
-            InlineKeyboardButton("⚙️ Настройки пересылки", callback_data="forward_settings")
-        ],
-        [
-            InlineKeyboardButton("🟢 Активировать" if not config.is_active else "🔴 Деактивировать",
-                               callback_data="toggle_status")
-        ]
+# ---------- ОБЩИЕ ФУНКЦИИ ----------
+def user_id_from_update(update: Update) -> int:
+    if update.callback_query:
+        return update.callback_query.from_user.id
+    return update.effective_user.id
+
+# ---------- КОМАНДЫ ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    welcome = (
+        f"👋 Привет, {user.first_name}!\n\n"
+        "📁 Просто отправь мне файл и выбери действие.\n"
+        "🔹 Можно изменить имя/расширение\n"
+        "🔹 Подписка за 299₽ — доступ ко всем файлам\n\n"
+        "📏 Макс. размер: 100 МБ\n📌 Разрешены:\n"
+    ) + "\n".join(f"• {e}" for e in ALLOWED_EXTENSIONS)
+
+    kb = [
+        [InlineKeyboardButton("💳 Подписка", callback_data="cmd_subscribe")],
+        [InlineKeyboardButton("🔐 Приватность", callback_data="cmd_privacy")],
+        [InlineKeyboardButton("📂 Просмотр файлов", callback_data="cmd_browse")],
+        [InlineKeyboardButton("🔍 Поиск", callback_data="cmd_search")],
     ]
+    await update.message.reply_text(welcome, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    context.user_data['state'] = WAITING_FOR_FILE
 
-    if user_id in ADMIN_IDS:
-        buttons.append([
-            InlineKeyboardButton("🌐 Режим: " + ("Публичный" if PUBLIC_MODE else "Приватный"),
-                               callback_data="change_mode")
-        ])
+async def subscription_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = user_id_from_update(update)
+    txt = (
+        "✅ У вас активная подписка!\n\n"
+        "Вы можете просматривать и скачивать все файлы, загруженные в бота.\n\n"
+        "Используйте:\n"
+        "/browse - просмотр файлов\n"
+        "/search - поиск файлов\n"
+        "/privacy - настройки приватности"
+    ) if user_id in subscribed_users else (
+        "🔒 Премиум-подписка\n\n"
+        "💰 Стоимость: 299 руб./месяц\n\n"
+        "Возможности:\n"
+        "• Просмотр всех файлов других пользователей\n"
+        "• Скачивание файлов в один клик\n"
+        "• Поиск по файлам\n"
+        "• Статистика популярных файлов\n\n"
+        "Для покупки свяжитесь с @admin"
+    )
+    if update.callback_query:
+        await update.callback_query.message.reply_text(txt)
+    else:
+        await update.message.reply_text(txt)
 
-    return InlineKeyboardMarkup(buttons)
-
-def get_content_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    config = user_configs.get(user_id, UserConfig())
-    buttons = []
-    content_types = list(config.content_types.keys())
-
-    for i in range(0, len(content_types), 2):
-        row = []
-        for j in range(i, min(i+2, len(content_types))):
-            content_type = content_types[j]
-            enabled = config.content_types[content_type]
-            row.append(InlineKeyboardButton(
-                f"{'✅' if enabled else '❌'} {content_type.capitalize()}",
-                callback_data=f"toggle_{content_type}"
-            ))
-        buttons.append(row)
-
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
-    return InlineKeyboardMarkup(buttons)
-
-def get_forward_settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Forward", callback_data="set_forward")],
-        [InlineKeyboardButton("Copy", callback_data="set_copy")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
-    ])
-
-# === Команды ===
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not check_access(user_id):
-        await update.message.reply_text("⛔ Бот доступен только администраторам.")
+async def toggle_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = user_id_from_update(update)
+    files = user_files.get(user_id, [])
+    if not files:
+        txt = "У вас еще нет загруженных файлов."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(txt)
+        else:
+            await update.message.reply_text(txt)
         return
 
-    if user_id not in user_configs:
-        user_configs[user_id] = UserConfig()
+    kb = [
+        [InlineKeyboardButton("🔓 Сделать все публичными", callback_data="set_all_public")],
+        [InlineKeyboardButton("🔒 Сделать все приватными", callback_data="set_all_private")],
+        [InlineKeyboardButton("📋 Управлять отдельными файлами", callback_data="manage_individual")],
+    ]
+    txt = "🔐 Настройки приватности файлов:\n\n• Публичные — видны подписчикам\n• Приватные — только вам"
+    if update.callback_query:
+        await update.callback_query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
-    config = user_configs[user_id]
-    mode_status = "🌐 Режим: " + ("Публичный" if PUBLIC_MODE else "Приватный")
+async def search_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = user_id_from_update(update)
+    if user_id not in subscribed_users:
+        txt = "🔒 Поиск файлов доступен только подписчикам."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(txt)
+        else:
+            await update.message.reply_text(txt)
+        return
+    txt = "🔍 Введите поисковый запрос (имя или расширение):"
+    if update.callback_query:
+        await update.callback_query.message.reply_text(txt)
+    else:
+        await update.message.reply_text(txt)
+    context.user_data['state'] = WAITING_FOR_SEARCH
 
-    text = (
-        "👀 <b>Панель управления ботом</b>\n\n"
-        f"{mode_status}\n"
-        f"🔹 Статус: {'🟢 Активен' if config.is_active else '🔴 Выключен'}\n"
-        f"🔹 Режим: {'Forward' if config.forward_mode == 'forward' else 'Copy'}\n"
-        f"🔹 Основной канал: {config.source_chat_id or '❌ Не установлен'}\n"
-        f"🔹 Резервный канал: {config.backup_chat_id or '❌ Не установлен'}\n\n"
-        "🆘 Помощь: /help"
+async def browse_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = user_id_from_update(update)
+    if user_id not in subscribed_users:
+        txt = "🔒 Доступно только подписчикам."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(txt)
+        else:
+            await update.message.reply_text(txt)
+        return
+
+    public_files = [f for uid, files in user_files.items()
+                    if uid != user_id for f in files if f.get('public', True)]
+    if not public_files:
+        txt = "📭 Пока нет публичных файлов."
+        if update.callback_query:
+            await update.callback_query.message.reply_text(txt)
+        else:
+            await update.message.reply_text(txt)
+        return
+
+    file_search_cache[user_id] = [public_files, 0]
+    await show_files_page(update, context, user_id, 0)
+
+async def show_files_page(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int) -> None:
+    if user_id not in file_search_cache:
+        if update.callback_query:
+            await update.callback_query.message.reply_text("❌ Результаты устарели.")
+        else:
+            await update.message.reply_text("❌ Результаты устарели.")
+        return
+
+    files, _ = file_search_cache[user_id]
+    total = (len(files) + FILES_PER_PAGE - 1) // FILES_PER_PAGE
+    page = max(0, min(page, total - 1))
+    start, end = page * FILES_PER_PAGE, min((page + 1) * FILES_PER_PAGE, len(files))
+
+    msg = f"📂 Найдено файлов: {len(files)}  |  Страница {page + 1}/{total}\n\n"
+    kb = []
+    for i in range(start, end):
+        f = files[i]
+        size = await get_file_size(context.bot, f['file_id'])
+        size_str = f"{size / 1024 / 1024:.1f}MB" if size > 1024 * 1024 else f"{size / 1024:.1f}KB"
+        msg += f"📄 {f['filename']} ({size_str})\n"
+        kb.append([InlineKeyboardButton(f"⬇️ {f['filename']}", callback_data=f"download_{i}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Назад", callback_data=f"page_{page - 1}"))
+    if page < total - 1:
+        nav.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"page_{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("🔍 Новый поиск", callback_data="new_search")])
+
+    reply_markup = InlineKeyboardMarkup(kb)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(msg, reply_markup=reply_markup)
+
+async def download_file(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int) -> None:
+    user_id = update.callback_query.from_user.id
+    if user_id not in file_search_cache:
+        await update.callback_query.answer("❌ Файл недоступен", show_alert=True)
+        return
+    files, _ = file_search_cache[user_id]
+    if not (0 <= idx < len(files)):
+        await update.callback_query.answer("❌ Файл не найден", show_alert=True)
+        return
+
+    f = files[idx]
+    try:
+        await update.callback_query.answer("⏳ Загружаем...")
+        tg_file = await context.bot.get_file(f['file_id'])
+        path = await tg_file.download_to_drive()
+        with open(path, 'rb') as fp:
+            await context.bot.send_document(
+                chat_id=update.callback_query.message.chat_id,
+                document=fp,
+                filename=f['filename'],
+                caption=f"✅ {f['filename']}"
+            )
+        os.remove(path)
+    except Exception as e:
+        logger.error(e)
+        await update.callback_query.answer("❌ Ошибка", show_alert=True)
+
+# ---------- ОБРАБОТКА ДОКУМЕНТОВ ----------
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get('state') != WAITING_FOR_FILE:
+        return
+    doc = update.message.document
+    if doc.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text("⚠️ Файл > 100 МБ.")
+        return
+
+    context.user_data.update({
+        'file_id': doc.file_id,
+        'original_filename': doc.file_name,
+        'original_extension': os.path.splitext(doc.file_name)[1],
+        'new_extension': os.path.splitext(doc.file_name)[1]
+    })
+
+    kb = [
+        [InlineKeyboardButton("✏️ Изменить имя", callback_data="change_name")],
+        [InlineKeyboardButton("🔄 Изменить расширение", callback_data="change_ext")],
+        [InlineKeyboardButton("✅ Сохранить как есть", callback_data="keep_as_is")],
+    ]
+    await update.message.reply_text(
+        f"📄 <b>{doc.file_name}</b>  |  {doc.file_size / 1024 / 1024:.2f} МБ\n\nВыберите действие:",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode='HTML'
     )
 
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard(user_id))
+# ---------- ОБРАБОТКА ТЕКСТА ----------
+async def handle_filename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get('state') != WAITING_FOR_NAME:
+        return
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Имя не может быть пустым.")
+        return
+    context.user_data['new_name'] = name
+    ext = context.user_data['new_extension']
+    kb = [
+        [InlineKeyboardButton("✅ Сохранить", callback_data="confirm_save")],
+        [InlineKeyboardButton("✏️ Изменить имя", callback_data="change_name")],
+        [InlineKeyboardButton("🔄 Изменить расширение", callback_data="change_ext")],
+    ]
+    await update.message.reply_text(
+        f"📄 Новое имя: <b>{name}{ext}</b>",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode='HTML'
+    )
 
-async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get('state') != WAITING_FOR_SEARCH:
+        return
+    query = update.message.text.strip().lower()
     user_id = update.effective_user.id
-
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Только для администраторов!")
+    if not query:
+        await update.message.reply_text("❌ Пустой запрос")
+        context.user_data['state'] = WAITING_FOR_FILE
         return
 
-    global PUBLIC_MODE
-    PUBLIC_MODE = not PUBLIC_MODE
+    found = [f for uid, files in user_files.items() if uid != user_id
+             for f in files if f.get('public', True) and query in f['filename'].lower()]
+    if not found:
+        await update.message.reply_text("❌ Ничего не найдено")
+        context.user_data['state'] = WAITING_FOR_FILE
+        return
 
-    mode = "ОБЩЕДОСТУПНЫЙ" if PUBLIC_MODE else "ПРИВАТНЫЙ"
-    await update.message.reply_text(f"✅ Режим изменен на: {mode}")
-    await start(update, context)
+    file_search_cache[user_id] = [found, 0]
+    await show_files_page(update, context, user_id, 0)
 
-# === Обработчики кнопок ===
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- СОХРАНЕНИЕ ----------
+async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user_id = query.from_user.id
+    try:
+        file_id = context.user_data['file_id']
+        new_name = context.user_data.get('new_name', os.path.splitext(context.user_data['original_filename'])[0])
+        new_ext = context.user_data.get('new_extension', context.user_data['original_extension'])
+        new_filename = f"{new_name}{new_ext}"
 
-    if not check_access(user_id):
-        await query.answer("⛔ Нет доступа!", show_alert=True)
+        file = await context.bot.get_file(file_id)
+        path = await file.download_to_drive()
+        new_path = os.path.join(os.path.dirname(path), new_filename)
+        os.rename(path, new_path)
+
+        with open(new_path, 'rb') as fp:
+            await context.bot.send_document(
+                chat_id=query.message.chat_id,
+                document=fp,
+                filename=new_filename,
+                caption=f"✅ Сохранено: {new_filename}",
+                parse_mode='HTML'
+            )
+
+        user_files.setdefault(user_id, []).append({
+            "file_id": file_id,
+            "filename": new_filename,
+            "public": True,
+            "timestamp": datetime.now()
+        })
+        os.remove(new_path)
+        context.user_data.clear()
+        context.user_data['state'] = WAITING_FOR_FILE
+        await query.delete_message()
+    except Exception as e:
+        logger.error(e)
+        await query.edit_message_text("⚠️ Ошибка при обработке файла.")
+
+# ---------- АДМИН ----------
+async def admin_add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Недостаточно прав")
         return
+    if not context.args:
+        await update.message.reply_text("Использование: /add_subscription <user_id>")
+        return
+    try:
+        target = int(context.args[0])
+        subscribed_users.add(target)
+        await update.message.reply_text(f"✅ Пользователю {target} добавлена подписка")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID")
 
-    if user_id not in user_configs:
-        user_configs[user_id] = UserConfig()
-
-    config = user_configs[user_id]
+# ---------- ОБРАБОТКА КНОПОК ----------
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = query.from_user.id
 
-    if data == "toggle_status":
-        config.is_active = not config.is_active
-        save_configs()
-        await admin(update, context)
+    # Навигация / скачивание
+    if data.startswith("download_"):
+        await download_file(update, context, int(data[9:]))
+    elif data.startswith("page_"):
+        page = int(data[5:])
+        file_search_cache[user_id][1] = page
+        await show_files_page(update, context, user_id, page)
+    elif data == "new_search":
+        await search_files(query, context)
 
-    elif data == "content_settings":
-        await query.edit_message_text("🔧 Настройки контента:", reply_markup=get_content_settings_keyboard(user_id))
-
-    elif data == "forward_settings":
-        await query.edit_message_text("⚙️ Настройки пересылки:", reply_markup=get_forward_settings_keyboard())
-
-    elif data.startswith("toggle_"):
-        content_type = data[7:]
-        if content_type in config.content_types:
-            config.content_types[content_type] = not config.content_types[content_type]
-            save_configs()
-            await query.edit_message_text("🔧 Настройки контента:", reply_markup=get_content_settings_keyboard(user_id))
-
-    elif data == "set_forward":
-        config.forward_mode = "forward"
-        save_configs()
-        await query.edit_message_text("✅ Режим пересылки установлен: Forward")
-        await asyncio.sleep(1)
-        await query.edit_message_text("⚙️ Настройки пересылки:", reply_markup=get_forward_settings_keyboard())
-
-    elif data == "set_copy":
-        config.forward_mode = "copy"
-        save_configs()
-        await query.edit_message_text("✅ Режим пересылки установлен: Copy")
-        await asyncio.sleep(1)
-        await query.edit_message_text("⚙️ Настройки пересылки:", reply_markup=get_forward_settings_keyboard())
-
-    elif data in ["set_source", "set_backup"]:
-        await query.edit_message_text(f"📥 Введите ID {'основного' if data == 'set_source' else 'резервного'} канала:")
-        context.user_data['action'] = data
-
-    elif data == "change_mode":
-        global PUBLIC_MODE
-        PUBLIC_MODE = not PUBLIC_MODE
-        mode = "Публичный" if PUBLIC_MODE else "Приватный"
-        await query.answer(f"Режим изменен на: {mode}", show_alert=True)
-        await admin(update, context)
-
+    # Работа с файлом
+    elif data == "change_name":
+        await query.edit_message_text("✏️ Введите новое имя файла (без расширения):")
+        context.user_data['state'] = WAITING_FOR_NAME
+    elif data == "change_ext":
+        kb = [[InlineKeyboardButton(ext, callback_data=f"set_ext{ext}")] for ext in ALLOWED_EXTENSIONS]
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+        await query.edit_message_text("🔄 Выберите новое расширение:", reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("set_ext"):
+        context.user_data['new_extension'] = data[7:]
+        name = context.user_data.get('new_name', os.path.splitext(context.user_data['original_filename'])[0])
+        kb = [
+            [InlineKeyboardButton("✏️ Изменить имя", callback_data="change_name")],
+            [InlineKeyboardButton("🔄 Изменить расширение", callback_data="change_ext")],
+            [InlineKeyboardButton("✅ Сохранить", callback_data="confirm_save")],
+        ]
+        await query.edit_message_text(
+            f"📄 Новое имя файла: <b>{name}{data[7:]}</b>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    elif data in ["keep_as_is", "confirm_save"]:
+        await process_file(update, context)
     elif data == "back_to_main":
-        await admin(update, context)
+        kb = [
+            [InlineKeyboardButton("✏️ Изменить имя", callback_data="change_name")],
+            [InlineKeyboardButton("🔄 Изменить расширение", callback_data="change_ext")],
+            [InlineKeyboardButton("✅ Сохранить как есть", callback_data="keep_as_is")],
+        ]
+        await query.edit_message_text(
+            f"📄 Файл: <b>{context.user_data['original_filename']}</b>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else update.callback_query.from_user.id
-    config = user_configs.get(user_id, UserConfig())
-    mode_status = "🌐 Режим: " + ("Публичный" if PUBLIC_MODE else "Приватный")
+    # Приватность
+    elif data == "set_all_public":
+        for f in user_files.get(user_id, []):
+            f['public'] = True
+        await query.edit_message_text("✅ Все файлы теперь публичные")
+    elif data == "set_all_private":
+        for f in user_files.get(user_id, []):
+            f['public'] = False
+        await query.edit_message_text("✅ Все файлы теперь приватные")
+    elif data == "manage_individual":
+        files = user_files.get(user_id, [])
+        msg = "📋 Ваши файлы:\n\n"
+        kb = []
+        for i, f in enumerate(files, 1):
+            status = "🔓" if f['public'] else "🔒"
+            msg += f"{i}. {status} {f['filename']}\n"
+            kb.append([InlineKeyboardButton(
+                f"{'Скрыть' if f['public'] else 'Показать'} {f['filename']}",
+                callback_data=f"toggle_{i - 1}")])
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_privacy")])
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("toggle_"):
+        idx = int(data[7:])
+        files = user_files.get(user_id, [])
+        if 0 <= idx < len(files):
+            files[idx]['public'] ^= True
+            status = "публичный" if files[idx]['public'] else "приватный"
+            await query.edit_message_text(f"✅ Файл теперь {status}")
+    elif data == "back_to_privacy":
+        await toggle_privacy(query, context)
 
-    text = (
-        "👀️ <b>Панель управления ботом</b>\n\n"
-        f"{mode_status}\n"
-        f"🔹 Статус: {'🟢 Активен' if config.is_active else '🔴 Выключен'}\n"
-        f"🔹 Режим: {'Forward' if config.forward_mode == 'forward' else 'Copy'}\n"
-        f"🔹 Основной канал: {config.source_chat_id or '❌ Не установлен'}\n"
-        f"🔹 Резервный канал: {config.backup_chat_id or '❌ Не установлен'}"
-    )
+    # Команды из /start
+    elif data == "cmd_subscribe":
+        await subscription_info(query, context)
+        await query.delete_message()
+    elif data == "cmd_privacy":
+        await toggle_privacy(query, context)
+        await query.delete_message()
+    elif data == "cmd_browse":
+        await browse_files(query, context)
+        await query.delete_message()
+    elif data == "cmd_search":
+        await search_files(query, context)
+        await query.delete_message()
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=get_main_keyboard(user_id))
-    elif update.message:
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard(user_id))
-
-# === Обработчик сообщений ===
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not check_access(user_id):
-        await update.message.reply_text("⛔ Бот доступен только администраторам.")
-        return
-
-    if user_id not in user_configs:
-        user_configs[user_id] = UserConfig()
-
-    config = user_configs[user_id]
-
-    if 'action' not in context.user_data:
-        return
-
-    text = update.message.text.strip()
-    action = context.user_data['action']
-
-    try:
-        if action in ['set_source', 'set_backup']:
-            if text.startswith('https://t.me/'):
-                username = text.split('/')[-1]
-                chat = await update.get_bot().get_chat(f"@{username}")
-                chat_id = chat.id
-            else:
-                chat_id = int(text)
-
-            if not await is_admin(update.get_bot(), user_id, chat_id):
-                await update.message.reply_text("❌ Вы не администратор этого канала!")
-                return
-
-            if action == 'set_source':
-                config.source_chat_id = chat_id
-                await update.message.reply_text(f"✅ Основной канал установлен: {chat_id}")
-            else:
-                config.backup_chat_id = chat_id
-                await update.message.reply_text(f"✅ Резервный канал установлен: {chat_id}")
-
-            save_configs()
-            del context.user_data['action']
-            await admin(update, context)
-
-    except (ValueError, IndexError):
-        await update.message.reply_text("❌ Неверный формат. Введите ID канала или ссылку вида https://t.me/username")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-
-# === Обработчик постов ===
-async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.channel_post:
-        return
-
-    post = update.channel_post
-
-    for user_id, config in user_configs.items():
-        if config.is_active and post.chat.id == config.source_chat_id and config.backup_chat_id:
-            content_type = None
-            if post.text and config.content_types["text"]:
-                content_type = "text"
-            elif post.photo and config.content_types["photo"]:
-                content_type = "photo"
-            elif post.video and config.content_types["video"]:
-                content_type = "video"
-            elif post.document and config.content_types["document"]:
-                content_type = "document"
-            elif post.audio and config.content_types["audio"]:
-                content_type = "audio"
-            elif post.voice and config.content_types["voice"]:
-                content_type = "voice"
-            elif post.sticker and config.content_types["sticker"]:
-                content_type = "sticker"
-            elif post.poll and config.content_types["poll"]:
-                content_type = "poll"
-            elif post.location and config.content_types["location"]:
-                content_type = "location"
-
-            if not content_type:
-                continue
-
-            try:
-                if config.forward_mode == "forward":
-                    await post.forward(config.backup_chat_id)
-                else:
-                    await context.bot.copy_message(
-                        chat_id=config.backup_chat_id,
-                        from_chat_id=post.chat.id,
-                        message_id=post.message_id
-                    )
-            except Exception as e:
-                logging.error(f"Ошибка пересылки: {e}")
-
-# === Обработчик ошибок ===
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.error(f"Ошибка: {context.error}", exc_info=True)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-📌 <b>Бот для резервного копирования каналов</b>
-
-⚡ <b>Что делает:</b>
-Автоматически пересылает новые сообщения из основного канала в резервный
-
-🛠 <b>Как настроить:</b>
-1. Добавьте бота в оба канала как админа
-2. Укажите основной и резервный каналы
-3. Выберите типы контента для пересылки
-4. Включите бота кнопкой "Активировать"
-
-🔧 <b>Команды:</b>
-/start - открыть меню
-/help - эта подсказка
-
-⚠ <b>Важно:</b>
-• Бот должен быть админом в обоих каналах
-• Поддерживаются: текст, фото, видео, документы
-• Можно пересылать как ссылкой, так и копией
-"""
-    await update.message.reply_text(help_text, parse_mode="HTML")
-
-# === Запуск ===
-if __name__ == '__main__':
-    # Загружаем конфиги при запуске
-    load_configs()
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
+# ---------- RUN ----------
+def main() -> None:
+    app = ApplicationBuilder().token("8244258907:AAGSOfk1CMoBku1ChaL-lTEjWdFG7ll_EYo").build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("mode", set_mode))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND, message_handler))
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_post_handler))
-    app.add_error_handler(error_handler)
-
-    print("✅ Бот запущен!")
+    app.add_handler(CommandHandler("subscribe", subscription_info))
+    app.add_handler(CommandHandler("privacy", toggle_privacy))
+    app.add_handler(CommandHandler("browse", browse_files))
+    app.add_handler(CommandHandler("search", search_files))
+    app.add_handler(CommandHandler("add_subscription", admin_add_subscription))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: (
+        handle_filename(u, c) if c.user_data.get('state') == WAITING_FOR_NAME else
+        handle_search(u, c)   if c.user_data.get('state') == WAITING_FOR_SEARCH else None
+    )))
+    app.add_handler(CallbackQueryHandler(button_callback))
     app.run_polling()
+
+if __name__ == '__main__':
+    main()
