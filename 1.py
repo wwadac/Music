@@ -6,7 +6,7 @@ import tempfile
 
 # === НАСТРОЙКА ===
 TOKEN = "8244258907:AAGSOfk1CMoBku1ChaL-lTEjWdFG7ll_EYo"
-TARGET_CHAT_ID = -1001234567890  # ← ЗАМЕНИ НА ID СВОЕЙ ГРУППЫ/КАНАЛА (с -100)
+TARGET_CHAT_ID = -1003211394319  # ← ЗАМЕНИ НА ID СВОЕЙ ГРУППЫ/КАНАЛА (с -100)
 
 
 # Приветственное сообщение
@@ -273,4 +273,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
